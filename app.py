@@ -1,6 +1,10 @@
-__import__('pysqlite3')
+# MUST BE THE FIRST LINE
 import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+try:
+    __import__('pysqlite3')
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
 
 import streamlit as st
 import os
@@ -11,7 +15,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQAWithSourcesChain
 
-# --- UI CONFIGURATION & NEON THEME ---
+# --- UI CONFIGURATION ---
 st.set_page_config(page_title="NEURAL KNOWLEDGE ENGINE", layout="wide")
 
 def apply_neon_theme():
@@ -56,33 +60,61 @@ apply_neon_theme()
 # --- BACKEND LOGIC ---
 def process_documents(uploaded_files, openai_api_key):
     all_docs = []
-    for uploaded_file in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_path = tmp_file.name
-        
-        loader = PyPDFLoader(tmp_path)
-        docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        splits = text_splitter.split_documents(docs)
-        all_docs.extend(splits)
-        os.remove(tmp_path)
+    try:
+        for uploaded_file in uploaded_files:
+            # Create a temporary file that handles its own cleanup via context manager
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
+            
+            try:
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+                # Store original filename in metadata for better source tracking
+                for doc in docs:
+                    doc.metadata["source"] = uploaded_file.name
+                
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+                splits = text_splitter.split_documents(docs)
+                all_docs.extend(splits)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-    embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-    vectorstore = Chroma.from_documents(documents=all_docs, embedding=embeddings)
-    return vectorstore
+        embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+        # Use an ephemeral in-memory vectorstore to avoid file permission issues on cloud
+        vectorstore = Chroma.from_documents(
+            documents=all_docs, 
+            embedding=embeddings,
+            collection_name="knowledge_engine"
+        )
+        return vectorstore
+    except Exception as e:
+        st.error(f"Error processing documents: {str(e)}")
+        return None
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("⚙️ ENGINE CORE")
+    # API Key Handling (Check for environment variable or manual input)
     api_key = st.text_input("OpenAI API Key", type="password")
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+    
     st.divider()
     uploaded_files = st.file_uploader("Ingest Research Papers (PDF)", type="pdf", accept_multiple_files=True)
     
-    if st.button("INITIALIZE ENGINE") and uploaded_files and api_key:
-        with st.spinner("Decoding Data Structures..."):
-            st.session_state.vectorstore = process_documents(uploaded_files, api_key)
-            st.success("Knowledge Base Synced.")
+    if st.button("INITIALIZE ENGINE"):
+        if not api_key:
+            st.error("Missing OpenAI API Key")
+        elif not uploaded_files:
+            st.error("No documents uploaded")
+        else:
+            with st.spinner("Decoding Data Structures..."):
+                vs = process_documents(uploaded_files, api_key)
+                if vs:
+                    st.session_state.vectorstore = vs
+                    st.success("Knowledge Base Synced.")
 
 # --- MAIN INTERFACE ---
 st.title("⚡ AI KNOWLEDGE ENGINE")
@@ -91,33 +123,44 @@ st.caption("Advanced Semantic Retrieval & Synthesis System")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Display chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+# Chat Input
 if prompt := st.chat_input("Query the knowledge base..."):
     if not api_key:
         st.error("Please enter an OpenAI API Key in the sidebar.")
     elif "vectorstore" not in st.session_state:
         st.error("Please upload and initialize documents first.")
     else:
+        # Add user message to history
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
             with st.spinner("Synthesizing response..."):
-                llm = ChatOpenAI(model_name="gpt-4o", temperature=0, openai_api_key=api_key)
-                chain = RetrievalQAWithSourcesChain.from_chain_type(
-                    llm=llm,
-                    chain_type="stuff",
-                    retriever=st.session_state.vectorstore.as_retriever()
-                )
-                
-                response = chain.invoke({"question": prompt})
-                answer = response['answer']
-                sources = response.get('sources', 'N/A')
-                full_response = f"{answer}\n\n**SOURCES:**\n{sources}"
-                st.markdown(full_response)
-                
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+                try:
+                    llm = ChatOpenAI(model_name="gpt-4o", temperature=0, openai_api_key=api_key)
+                    
+                    # Setting up the chain
+                    chain = RetrievalQAWithSourcesChain.from_chain_type(
+                        llm=llm,
+                        chain_type="stuff",
+                        retriever=st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
+                    )
+                    
+                    response = chain.invoke({"question": prompt})
+                    
+                    answer = response.get('answer', "I couldn't find an answer.")
+                    sources = response.get('sources', '').strip()
+                    
+                    full_response = f"{answer}\n\n**SOURCES:**\n{sources if sources else 'No specific source identified.'}"
+                    st.markdown(full_response)
+                    
+                    # Save assistant message to history
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                except Exception as e:
+                    st.error(f"Engine Error: {str(e)}")
