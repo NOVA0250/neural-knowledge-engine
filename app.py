@@ -2,12 +2,12 @@ import streamlit as st
 import os
 import tempfile
 
-# MODERN LANGCHAIN IMPORTS
+# --- MODERN LANGCHAIN IMPORTS (BATTLE-TESTED) ---
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS  # Switched to FAISS
-from langchain.chains import create_retrieval_chain
+from langchain_community.vectorstores import FAISS
+from langchain.chains.retrieval import create_retrieval_chain  # EXPLICIT PATH
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -76,8 +76,6 @@ def process_documents(uploaded_files, openai_api_key):
                     os.remove(tmp_path)
 
         embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-        
-        # FAISS is much more stable on experimental Python versions
         vectorstore = FAISS.from_documents(all_docs, embeddings)
         return vectorstore
     except Exception as e:
@@ -134,6 +132,7 @@ if prompt := st.chat_input("Query..."):
                     ])
                     
                     combine_docs_chain = create_stuff_documents_chain(llm, prompt_template)
+                    # This uses the explicitly imported retrieval chain
                     rag_chain = create_retrieval_chain(st.session_state.vectorstore.as_retriever(), combine_docs_chain)
                     
                     response = rag_chain.invoke({"input": prompt})
