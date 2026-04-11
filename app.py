@@ -7,7 +7,7 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain.chains.retrieval import create_retrieval_chain  # EXPLICIT PATH
+from langchain.chains.retrieval import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -85,7 +85,11 @@ def process_documents(uploaded_files, openai_api_key):
 # --- SIDEBAR ---
 with st.sidebar:
     st.title("⚙️ ENGINE CORE")
-    api_key = st.text_input("OpenAI API Key", type="password")
+
+    # Prefer secret from Streamlit Cloud, fall back to user input
+    default_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
+    api_key = st.text_input("OpenAI API Key", value=default_key, type="password")
+
     st.divider()
     uploaded_files = st.file_uploader("Ingest Research Papers (PDF)", type="pdf", accept_multiple_files=True)
     
@@ -132,13 +136,16 @@ if prompt := st.chat_input("Query..."):
                     ])
                     
                     combine_docs_chain = create_stuff_documents_chain(llm, prompt_template)
-                    # This uses the explicitly imported retrieval chain
-                    rag_chain = create_retrieval_chain(st.session_state.vectorstore.as_retriever(), combine_docs_chain)
+                    rag_chain = create_retrieval_chain(
+                        st.session_state.vectorstore.as_retriever(), combine_docs_chain
+                    )
                     
                     response = rag_chain.invoke({"input": prompt})
                     
                     answer = response["answer"]
-                    sources = list(set([doc.metadata.get("source", "Unknown") for doc in response["context"]]))
+                    sources = list(set([
+                        doc.metadata.get("source", "Unknown") for doc in response["context"]
+                    ]))
                     
                     full_res = f"{answer}\n\n**SOURCES:**\n" + "\n".join([f"- {s}" for s in sources])
                     st.markdown(full_res)
