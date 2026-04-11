@@ -49,6 +49,8 @@ h1, h2, h3 {
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
+MAX_CHARS_PER_CHUNK = 6000   # ~1500 tokens, well within embedding model limits
+
 def extract_pages(file_bytes, filename):
     chunks, meta = [], []
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
@@ -60,12 +62,12 @@ def extract_pages(file_bytes, filename):
             text = (page.extract_text() or "").strip()
             if not text:
                 continue
-            # simple fixed-size chunking with overlap
             size, overlap = 800, 150
             start = 0
             while start < len(text):
-                piece = text[start:start + size]
-                if piece.strip():
+                piece = text[start:start + size].strip()
+                # skip empty or oversized pieces
+                if piece and len(piece) <= MAX_CHARS_PER_CHUNK:
                     chunks.append(piece)
                     meta.append({"source": filename, "page": i + 1})
                 start += size - overlap
@@ -75,8 +77,24 @@ def extract_pages(file_bytes, filename):
 
 
 def embed(texts, client):
-    resp = client.embeddings.create(model="text-embedding-3-small", input=texts)
-    return np.array([d.embedding for d in resp.data], dtype="float32")
+    """Embed a batch of texts. Returns float32 numpy array."""
+    # Sanitise: replace newlines (OpenAI recommendation) and ensure non-empty
+    clean = [t.replace("\n", " ").strip() for t in texts]
+    clean = [t if t else " " for t in clean]   # never send empty string
+    try:
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=clean,
+        )
+        return np.array([d.embedding for d in resp.data], dtype="float32")
+    except openai.AuthenticationError:
+        raise
+    except openai.RateLimitError:
+        raise RuntimeError("OpenAI rate limit hit — wait a moment and try again.")
+    except openai.BadRequestError as e:
+        raise RuntimeError(f"OpenAI rejected the request: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Embedding error: {e}")
 
 
 def build_index(uploaded_files, client):
@@ -90,13 +108,17 @@ def build_index(uploaded_files, client):
         st.error("No text could be extracted from the PDFs.")
         return None, None, None
 
+    st.info(f"Embedding {len(all_chunks)} chunks…")
     vecs = []
-    batch = 500
-    for i in range(0, len(all_chunks), batch):
-        vecs.append(embed(all_chunks[i:i+batch], client))
+    batch_size = 100   # conservative batch to avoid payload limits
+    progress = st.progress(0)
+    for i in range(0, len(all_chunks), batch_size):
+        vecs.append(embed(all_chunks[i:i + batch_size], client))
+        progress.progress(min((i + batch_size) / len(all_chunks), 1.0))
+    progress.empty()
+
     matrix = np.vstack(vecs)
     faiss.normalize_L2(matrix)
-
     index = faiss.IndexFlatIP(matrix.shape[1])
     index.add(matrix)
     return index, all_chunks, all_meta
@@ -149,14 +171,20 @@ with st.sidebar:
         elif not uploaded_files:
             st.error("Upload at least one PDF.")
         else:
-            client = openai.OpenAI(api_key=api_key)
-            with st.spinner("Parsing & indexing…"):
+            try:
+                client = openai.OpenAI(api_key=api_key)
                 idx, chunks, meta = build_index(uploaded_files, client)
-            if idx is not None:
-                st.session_state.update(
-                    index=idx, chunks=chunks, meta=meta, api_key=api_key
-                )
-                st.success(f"Indexed {len(chunks)} chunks from {len(uploaded_files)} file(s).")
+                if idx is not None:
+                    st.session_state.update(
+                        index=idx, chunks=chunks, meta=meta, api_key=api_key
+                    )
+                    st.success(f"Indexed {len(chunks)} chunks from {len(uploaded_files)} file(s).")
+            except openai.AuthenticationError:
+                st.error("Invalid API key — double-check it and try again.")
+            except RuntimeError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Unexpected error: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 st.title("⚡ AI KNOWLEDGE ENGINE")
@@ -182,14 +210,21 @@ if prompt := st.chat_input("Query the documents…"):
             with st.spinner("Synthesizing…"):
                 try:
                     client = openai.OpenAI(api_key=st.session_state.api_key)
-                    docs = retrieve(prompt, st.session_state.index,
-                                    st.session_state.chunks, st.session_state.meta, client)
+                    docs = retrieve(
+                        prompt,
+                        st.session_state.index,
+                        st.session_state.chunks,
+                        st.session_state.meta,
+                        client,
+                    )
                     ans = answer(prompt, docs, client)
                     srcs = list({f"{d['source']} (p.{d['page']})" for d in docs})
                     full = ans + "\n\n**SOURCES:**\n" + "\n".join(f"- {s}" for s in srcs)
                     st.markdown(full)
                     st.session_state.messages.append({"role": "assistant", "content": full})
                 except openai.AuthenticationError:
-                    st.error("Invalid API key — check and try again.")
+                    st.error("Invalid API key.")
+                except RuntimeError as e:
+                    st.error(str(e))
                 except Exception as e:
                     st.error(f"Error: {e}")
