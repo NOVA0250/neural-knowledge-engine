@@ -16,7 +16,7 @@ CHAT_MODEL  = "gemini-2.0-flash"
 
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 150
-EMBED_BATCH   = 25
+EMBED_BATCH = 150
 TOP_K         = 5
 
 
