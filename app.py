@@ -1,38 +1,100 @@
 import streamlit as st
 import os
 import tempfile
-import time
 
 from google import genai
-from google.genai import types
 import faiss
 import numpy as np
 import pypdf
-
-# ✅ LOCAL EMBEDDINGS
 from sentence_transformers import SentenceTransformer
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-CHAT_MODEL  = "gemini-1.5-flash"   # ✅ cheaper + stable
+CHAT_MODEL = "gemini-1.5-flash"
 
-CHUNK_SIZE    = 1200
+CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 100
-EMBED_BATCH   = 100
-TOP_K         = 5
+EMBED_BATCH = 100
+TOP_K = 5
 
-# Load local embedding model once
+# Load local embedding model
 local_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 
+# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Neural Knowledge Engine", layout="wide")
+
+# ── UI STYLE (GLOW + GLASS) ───────────────────────────────────────────────────
+st.markdown("""
+<style>
+html, body, .stApp {
+    background: radial-gradient(circle at top, #0a0a12, #050507);
+    color: #d1d5db;
+}
+
+:root {
+    --glow: 0 0 12px rgba(0,255,255,0.6),
+            0 0 24px rgba(0,255,255,0.3);
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, #6a00ff, #00f0ff);
+    color: white;
+    border-radius: 10px;
+    transition: all 0.25s ease;
+}
+.stButton > button:hover {
+    box-shadow: var(--glow);
+    transform: translateY(-2px);
+}
+
+[data-testid="stSidebar"] {
+    background: rgba(15,15,25,0.8);
+    backdrop-filter: blur(10px);
+}
+
+[data-testid="stChatMessage"] {
+    background: rgba(20,20,35,0.7);
+    border-radius: 14px;
+    padding: 12px;
+    transition: 0.25s;
+}
+[data-testid="stChatMessage"]:hover {
+    box-shadow: var(--glow);
+}
+
+[data-testid="stChatInput"] textarea {
+    background: #0a0a10 !important;
+    color: #00f0ff !important;
+    border-radius: 10px !important;
+}
+[data-testid="stChatInput"] textarea:focus {
+    box-shadow: var(--glow);
+}
+
+h1 {
+    background: linear-gradient(90deg, #00f0ff, #6a00ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-align: center;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── TITLE ─────────────────────────────────────────────────────────────────────
+st.markdown("<h1>⚡ Neural Knowledge Engine</h1>", unsafe_allow_html=True)
+st.markdown(
+    "<p style='text-align:center;color:#6b7280;'>RAG • Semantic Search • AI Intelligence</p>",
+    unsafe_allow_html=True
+)
+
 # ── CLIENT ────────────────────────────────────────────────────────────────────
-def get_client(api_key: str):
+def get_client(api_key):
     return genai.Client(api_key=api_key)
 
 
 # ── PDF CHUNKING ──────────────────────────────────────────────────────────────
-def extract_chunks(file_bytes: bytes, filename: str):
+def extract_chunks(file_bytes, filename):
     chunks, meta = [], []
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(file_bytes)
         tmp = f.name
@@ -40,23 +102,17 @@ def extract_chunks(file_bytes: bytes, filename: str):
     try:
         reader = pypdf.PdfReader(tmp)
         for page_num, page in enumerate(reader.pages):
-            raw = (page.extract_text() or "").strip()
-            if not raw:
+            text = (page.extract_text() or "").strip()
+            if not text:
                 continue
 
-            text = " ".join(raw.split())
-
+            text = " ".join(text.split())
             start = 0
             while start < len(text):
-                piece = text[start:start + CHUNK_SIZE].strip()
-
+                piece = text[start:start+CHUNK_SIZE]
                 if len(piece) > 60:
                     chunks.append(piece)
-                    meta.append({
-                        "source": filename,
-                        "page": page_num + 1
-                    })
-
+                    meta.append({"source": filename, "page": page_num+1})
                 start += CHUNK_SIZE - CHUNK_OVERLAP
     finally:
         os.remove(tmp)
@@ -64,169 +120,129 @@ def extract_chunks(file_bytes: bytes, filename: str):
     return chunks, meta
 
 
-# ── LOCAL EMBEDDING (ZERO API) ─────────────────────────────────────────────────
-def embed_batch(texts: list) -> np.ndarray:
-    embeddings = local_model.encode(texts)
-    return np.array(embeddings, dtype="float32")
+# ── LOCAL EMBEDDINGS ──────────────────────────────────────────────────────────
+def embed_batch(texts):
+    return np.array(local_model.encode(texts), dtype="float32")
 
 
 # ── BUILD INDEX ───────────────────────────────────────────────────────────────
-def build_index(uploaded_files):
+def build_index(files):
     all_chunks, all_meta = [], []
-
-    for uf in uploaded_files:
-        c, m = extract_chunks(uf.getvalue(), uf.name)
+    for f in files:
+        c, m = extract_chunks(f.getvalue(), f.name)
         all_chunks.extend(c)
         all_meta.extend(m)
 
     if not all_chunks:
-        return None, None, None, "No readable text found."
+        return None, None, None
 
-    # 🔥 LIMIT chunks (prevents overload)
     if len(all_chunks) > 150:
         all_chunks = all_chunks[:150]
         all_meta = all_meta[:150]
 
-    progress = st.progress(0, text="Embedding locally...")
+    vecs = embed_batch(all_chunks)
+    faiss.normalize_L2(vecs)
 
-    all_vecs = []
+    index = faiss.IndexFlatIP(vecs.shape[1])
+    index.add(vecs)
 
-    for i in range(0, len(all_chunks), EMBED_BATCH):
-        batch = all_chunks[i:i + EMBED_BATCH]
-        vecs = embed_batch(batch)
-        all_vecs.append(vecs)
-
-        pct = min((i + EMBED_BATCH) / len(all_chunks), 1.0)
-        progress.progress(pct)
-
-    progress.empty()
-
-    matrix = np.vstack(all_vecs)
-    faiss.normalize_L2(matrix)
-
-    index = faiss.IndexFlatIP(matrix.shape[1])
-    index.add(matrix)
-
-    return index, all_chunks, all_meta, None
+    return index, all_chunks, all_meta
 
 
 # ── RETRIEVE ──────────────────────────────────────────────────────────────────
 def retrieve(query, index, chunks, meta):
-    q_vec = embed_batch([query])
-    faiss.normalize_L2(q_vec)
+    q = embed_batch([query])
+    faiss.normalize_L2(q)
+    _, ids = index.search(q, TOP_K)
 
-    _, ids = index.search(q_vec, TOP_K)
-
-    return [
-        {"text": chunks[i], **meta[i]}
-        for i in ids[0] if i != -1
-    ]
+    return [{"text": chunks[i], **meta[i]} for i in ids[0] if i != -1]
 
 
-# ── CACHED GEMINI RESPONSE ────────────────────────────────────────────────────
+# ── CACHE ANSWER ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def cached_generate_answer(prompt: str, api_key: str):
+def cached_answer(prompt, api_key):
     client = genai.Client(api_key=api_key)
-
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=prompt
-    )
-
-    return response.text
+    res = client.models.generate_content(model=CHAT_MODEL, contents=prompt)
+    return res.text
 
 
 # ── GENERATE ANSWER ───────────────────────────────────────────────────────────
 def generate_answer(query, docs, api_key):
     context = "\n\n---\n\n".join(
-        f"[{d['source']} | Page {d['page']}]\n{d['text']}"
-        for d in docs
+        f"[{d['source']} | Page {d['page']}]\n{d['text']}" for d in docs
     )
 
     prompt = f"""
-You are an expert assistant.
+Answer only using context.
 
-Answer ONLY from the context below.
-Be concise and clear.
-
-CONTEXT:
 {context}
 
-QUESTION:
-{query}
+Question: {query}
 """
 
     try:
-        return cached_generate_answer(prompt, api_key)
-    except Exception:
-        return "⚠️ API busy or quota issue. Try again later."
+        return cached_answer(prompt, api_key)
+    except:
+        return "⚠️ API busy or quota issue."
 
 
-# ── UI ────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Neural Knowledge Engine", layout="wide")
-
-st.title("⚡ Neural Knowledge Engine")
-
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 api_key = st.sidebar.text_input("Gemini API Key", type="password")
 
-uploaded_files = st.sidebar.file_uploader(
-    "Upload PDFs", type="pdf", accept_multiple_files=True
-)
+uploaded = st.sidebar.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+
+if "index" in st.session_state:
+    st.sidebar.success("🟢 Engine Ready")
+else:
+    st.sidebar.warning("🔴 Not Initialized")
 
 if st.sidebar.button("Initialize"):
-    if not uploaded_files:
+    if not uploaded:
         st.error("Upload PDFs first.")
     else:
-        idx, chunks, meta, err = build_index(uploaded_files)
-
-        if err:
-            st.error(err)
-        else:
-            st.session_state.index = idx
-            st.session_state.chunks = chunks
-            st.session_state.meta = meta
-            st.session_state.api_key = api_key
-            st.success("Index built successfully 🚀")
+        idx, chunks, meta = build_index(uploaded)
+        st.session_state.index = idx
+        st.session_state.chunks = chunks
+        st.session_state.meta = meta
+        st.session_state.api_key = api_key
+        st.success("Index built 🚀")
 
 
 # ── CHAT ──────────────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
 if prompt := st.chat_input("Ask something..."):
     if "index" not in st.session_state:
-        st.error("Initialize first.")
+        st.error("Initialize first")
     elif not api_key:
-        st.error("Enter API key.")
+        st.error("Enter API key")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            docs = retrieve(
-                prompt,
-                st.session_state.index,
-                st.session_state.chunks,
-                st.session_state.meta
-            )
+            with st.spinner("⚡ Thinking..."):
+                docs = retrieve(prompt,
+                                st.session_state.index,
+                                st.session_state.chunks,
+                                st.session_state.meta)
 
-            answer = generate_answer(
-                prompt,
-                docs,
-                st.session_state.api_key
-            )
+                ans = generate_answer(prompt, docs, st.session_state.api_key)
+                st.markdown(ans)
 
-            st.markdown(answer)
+                # sources
+                if docs:
+                    sources = set([f"{d['source']} p.{d['page']}" for d in docs])
+                    st.markdown("<br>".join([f"📄 {s}" for s in sources]), unsafe_allow_html=True)
 
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer}
-            )
+        st.session_state.messages.append({"role": "assistant", "content": ans})
 
 
-# ── CLEAR CHAT ────────────────────────────────────────────────────────────────
+# ── CLEAR ─────────────────────────────────────────────────────────────────────
 if st.button("Clear Chat"):
     st.session_state.messages = []
     st.rerun()
