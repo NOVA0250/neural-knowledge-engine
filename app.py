@@ -9,15 +9,19 @@ import faiss
 import numpy as np
 import pypdf
 
+# ✅ LOCAL EMBEDDINGS
+from sentence_transformers import SentenceTransformer
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-EMBED_MODEL = "gemini-embedding-001"   # ✅ FIXED
-FALLBACK_MODEL = "gemini-embedding-2-preview"
-CHAT_MODEL  = "gemini-2.0-flash"
+CHAT_MODEL  = "gemini-1.5-flash"   # ✅ cheaper + stable
 
 CHUNK_SIZE    = 1200
 CHUNK_OVERLAP = 100
-EMBED_BATCH = 150
+EMBED_BATCH   = 100
 TOP_K         = 5
+
+# Load local embedding model once
+local_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 
 # ── CLIENT ────────────────────────────────────────────────────────────────────
@@ -28,6 +32,7 @@ def get_client(api_key: str):
 # ── PDF CHUNKING ──────────────────────────────────────────────────────────────
 def extract_chunks(file_bytes: bytes, filename: str):
     chunks, meta = [], []
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
         f.write(file_bytes)
         tmp = f.name
@@ -44,12 +49,14 @@ def extract_chunks(file_bytes: bytes, filename: str):
             start = 0
             while start < len(text):
                 piece = text[start:start + CHUNK_SIZE].strip()
+
                 if len(piece) > 60:
                     chunks.append(piece)
                     meta.append({
                         "source": filename,
                         "page": page_num + 1
                     })
+
                 start += CHUNK_SIZE - CHUNK_OVERLAP
     finally:
         os.remove(tmp)
@@ -57,28 +64,14 @@ def extract_chunks(file_bytes: bytes, filename: str):
     return chunks, meta
 
 
-# ── EMBEDDING (ROBUST) ────────────────────────────────────────────────────────
-def embed_batch(client, texts: list, task: str) -> np.ndarray:
-    try:
-        result = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=texts,
-            config=types.EmbedContentConfig(task_type=task),
-        )
-        return np.array([e.values for e in result.embeddings], dtype="float32")
-
-    except Exception as e:
-        print("Primary model failed → switching to fallback:", str(e))
-
-        result = client.models.embed_content(
-            model=FALLBACK_MODEL,
-            contents=texts,
-        )
-        return np.array([e.values for e in result.embeddings], dtype="float32")
+# ── LOCAL EMBEDDING (ZERO API) ─────────────────────────────────────────────────
+def embed_batch(texts: list) -> np.ndarray:
+    embeddings = local_model.encode(texts)
+    return np.array(embeddings, dtype="float32")
 
 
 # ── BUILD INDEX ───────────────────────────────────────────────────────────────
-def build_index(uploaded_files, client):
+def build_index(uploaded_files):
     all_chunks, all_meta = [], []
 
     for uf in uploaded_files:
@@ -89,23 +82,22 @@ def build_index(uploaded_files, client):
     if not all_chunks:
         return None, None, None, "No readable text found."
 
-    progress = st.progress(0, text="Embedding...")
+    # 🔥 LIMIT chunks (prevents overload)
+    if len(all_chunks) > 150:
+        all_chunks = all_chunks[:150]
+        all_meta = all_meta[:150]
+
+    progress = st.progress(0, text="Embedding locally...")
 
     all_vecs = []
-    try:
-        for i in range(0, len(all_chunks), EMBED_BATCH):
-            batch = all_chunks[i:i + EMBED_BATCH]
-            vecs = embed_batch(client, batch, "RETRIEVAL_DOCUMENT")
-            all_vecs.append(vecs)
 
-            pct = min((i + EMBED_BATCH) / len(all_chunks), 1.0)
-            progress.progress(pct)
+    for i in range(0, len(all_chunks), EMBED_BATCH):
+        batch = all_chunks[i:i + EMBED_BATCH]
+        vecs = embed_batch(batch)
+        all_vecs.append(vecs)
 
-            time.sleep(0.05)
-
-    except Exception as e:
-        progress.empty()
-        return None, None, None, str(e)
+        pct = min((i + EMBED_BATCH) / len(all_chunks), 1.0)
+        progress.progress(pct)
 
     progress.empty()
 
@@ -119,8 +111,8 @@ def build_index(uploaded_files, client):
 
 
 # ── RETRIEVE ──────────────────────────────────────────────────────────────────
-def retrieve(query, index, chunks, meta, client):
-    q_vec = embed_batch(client, [query], "RETRIEVAL_QUERY")
+def retrieve(query, index, chunks, meta):
+    q_vec = embed_batch([query])
     faiss.normalize_L2(q_vec)
 
     _, ids = index.search(q_vec, TOP_K)
@@ -131,8 +123,21 @@ def retrieve(query, index, chunks, meta, client):
     ]
 
 
+# ── CACHED GEMINI RESPONSE ────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def cached_generate_answer(prompt: str, api_key: str):
+    client = genai.Client(api_key=api_key)
+
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=prompt
+    )
+
+    return response.text
+
+
 # ── GENERATE ANSWER ───────────────────────────────────────────────────────────
-def generate_answer(query, docs, client):
+def generate_answer(query, docs, api_key):
     context = "\n\n---\n\n".join(
         f"[{d['source']} | Page {d['page']}]\n{d['text']}"
         for d in docs
@@ -151,43 +156,10 @@ QUESTION:
 {query}
 """
 
-    import time
-
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=CHAT_MODEL,
-                contents=prompt
-            )
-
-            # ✅ SAFE RETURN
-            if hasattr(response, "text") and response.text:
-                return response.text
-            else:
-                return "⚠️ No response generated."
-
-        except Exception as e:
-            err = str(e)
-
-            # 🔥 HANDLE QUOTA ERROR
-            if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                wait_time = 5 * (attempt + 1)
-                time.sleep(wait_time)
-                continue
-
-            # 🔥 HANDLE INVALID KEY / PERMISSION
-            elif "401" in err or "403" in err:
-                return "❌ Invalid API key or permission issue."
-
-            # 🔥 HANDLE MODEL NOT FOUND
-            elif "404" in err:
-                return "❌ Model not available. Check model name."
-
-            # 🔥 UNKNOWN ERROR
-            else:
-                return f"❌ Error: {err}"
-
-    return "⚠️ Quota exceeded. Try again later."
+    try:
+        return cached_generate_answer(prompt, api_key)
+    except Exception:
+        return "⚠️ API busy or quota issue. Try again later."
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -202,11 +174,10 @@ uploaded_files = st.sidebar.file_uploader(
 )
 
 if st.sidebar.button("Initialize"):
-    if not api_key or not uploaded_files:
-        st.error("Provide API key + PDFs")
+    if not uploaded_files:
+        st.error("Upload PDFs first.")
     else:
-        client = get_client(api_key)
-        idx, chunks, meta, err = build_index(uploaded_files, client)
+        idx, chunks, meta, err = build_index(uploaded_files)
 
         if err:
             st.error(err)
@@ -229,23 +200,33 @@ for msg in st.session_state.messages:
 if prompt := st.chat_input("Ask something..."):
     if "index" not in st.session_state:
         st.error("Initialize first.")
+    elif not api_key:
+        st.error("Enter API key.")
     else:
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            client = get_client(st.session_state.api_key)
-
             docs = retrieve(
                 prompt,
                 st.session_state.index,
                 st.session_state.chunks,
-                st.session_state.meta,
-                client
+                st.session_state.meta
             )
 
-            answer = generate_answer(prompt, docs, client)
+            answer = generate_answer(
+                prompt,
+                docs,
+                st.session_state.api_key
+            )
 
             st.markdown(answer)
+
             st.session_state.messages.append(
                 {"role": "assistant", "content": answer}
             )
+
+
+# ── CLEAR CHAT ────────────────────────────────────────────────────────────────
+if st.button("Clear Chat"):
+    st.session_state.messages = []
+    st.rerun()
