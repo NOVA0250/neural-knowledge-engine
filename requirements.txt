@@ -5,3 +5,4 @@ numpy
 pypdf
 sentence-transformers
 scikit-learn
+pandas
