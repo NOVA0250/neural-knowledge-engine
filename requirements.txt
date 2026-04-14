@@ -1,7 +1,7 @@
 streamlit
-google-genai
+openai
 faiss-cpu
 numpy
 pypdf
 sentence-transformers
-torch --index-url https://download.pytorch.org/whl/cpu
+scikit-learn
