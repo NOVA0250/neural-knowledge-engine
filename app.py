@@ -7,6 +7,9 @@ import pandas as pd
 import pypdf
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+# provider SDKs imported lazily inside get_llm() to avoid import errors
+# when a package for an unused provider isn't installed
+
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Neural Knowledge Engine",
@@ -284,48 +287,55 @@ MAX_CHUNKS    = 400   # cap for stability
 
 # ── LLM CLIENT FACTORY ────────────────────────────────────────────────────────
 
-def get_llm(provider: str, api_key: str):
-    """Return a thin wrapper dict so the rest of the code stays provider-agnostic."""
-    if provider == "Gemini":
+# ── MODEL CONFIG PER PROVIDER ────────────────────────────────────────────────
+PROVIDER_MODELS = {
+    "Groq":   "llama-3.3-70b-versatile",   # free tier: 30 RPM / 14400 RPD
+    "Gemini": "gemini-2.0-flash",           # free tier: 15 RPM
+    "OpenAI": "gpt-4o-mini",               # paid
+}
+
+def get_llm(provider: str, api_key: str) -> dict:
+    """Return a provider-agnostic LLM wrapper dict."""
+    if provider == "Groq":
+        from groq import Groq
+        return {"provider": "groq", "client": Groq(api_key=api_key),
+                "model": PROVIDER_MODELS["Groq"]}
+    elif provider == "Gemini":
         from google import genai
-        client = genai.Client(api_key=api_key)
-        return {"provider": "gemini", "client": client}
+        return {"provider": "gemini", "client": genai.Client(api_key=api_key),
+                "model": PROVIDER_MODELS["Gemini"]}
     else:
         from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        return {"provider": "openai", "client": client}
+        return {"provider": "openai", "client": OpenAI(api_key=api_key),
+                "model": PROVIDER_MODELS["OpenAI"]}
 
 
-def llm_complete(llm: dict, prompt: str, max_retries: int = 3) -> str:
-    """Send a prompt with automatic retry + exponential backoff on rate limits."""
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            if llm["provider"] == "gemini":
-                resp = llm["client"].models.generate_content(
-                    model="gemini-2.0-flash", contents=prompt
-                )
-                return resp.text
-            else:
-                resp = llm["client"].chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return resp.choices[0].message.content
-        except Exception as e:
-            last_err = str(e)
-            is_rate = any(k in last_err.lower() for k in
-                          ("429", "quota", "rate", "resource_exhausted", "too many"))
-            if is_rate and attempt < max_retries - 1:
-                wait = 20 * (attempt + 1)   # 20s, 40s
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(last_err)
+def _is_rate_limit(err: str) -> bool:
+    e = err.lower()
+    return any(k in e for k in ("429", "quota", "rate_limit", "rate limit",
+                                "resource_exhausted", "too many", "overloaded"))
+
+
+def llm_complete(llm: dict, prompt: str) -> str:
+    """Single LLM call — NO retries (retries cause UI hangs). Raises on failure."""
+    try:
+        if llm["provider"] == "gemini":
+            resp = llm["client"].models.generate_content(
+                model=llm["model"], contents=prompt)
+            return resp.text
+        else:
+            # Groq and OpenAI share the same chat completions interface
+            resp = llm["client"].chat.completions.create(
+                model=llm["model"],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.choices[0].message.content
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
 
 
 def local_fallback_answer(query: str, docs: list) -> str:
-    """Return a structured answer from raw chunks — no API needed."""
+    """Best-effort answer from raw chunks — zero API calls."""
     if not docs:
         return "No relevant information found in the uploaded documents."
     qwords = set(query.lower().split())
@@ -333,29 +343,28 @@ def local_fallback_answer(query: str, docs: list) -> str:
     for d in docs:
         for sent in d["text"].split("."):
             s = sent.strip()
-            if not s:
+            if len(s) < 20:
                 continue
             hit = sum(1 for w in qwords if w in s.lower())
-            if hit > 0:
+            if hit:
                 scored.append((hit, s))
     scored.sort(reverse=True)
     best = [s for _, s in scored[:6]]
-    if best:
-        body = "\n\n".join(f"• {s}." for s in best)
-    else:
-        body = "\n\n".join(d["text"][:400] for d in docs[:3])
+    body = "\n\n".join(f"• {s}." for s in best) if best else \
+           "\n\n".join(d["text"][:400] for d in docs[:3])
     return (
-        f"**Best matching content** *(local mode — LLM unavailable)*\n\n{body}\n\n"
-        f"> ⚠️ API rate limit reached. Showing raw matched content. "
-        f"Wait ~60s and retry for an AI-synthesised answer."
+        "**Best matching content** *(local fallback — API unavailable)*\n\n"
+        + body +
+        "\n\n> 💡 For an AI-synthesised answer, wait ~60 s and retry, "
+        "or switch to **Groq** (free, 30 RPM) in the sidebar."
     )
 
 
 def validate_key(provider: str, api_key: str) -> str | None:
-    """Quick validation — returns error string or None if OK."""
+    """Single validation call — returns error string or None if OK."""
     try:
         llm = get_llm(provider, api_key)
-        llm_complete(llm, "Reply with the single word OK.", max_retries=1)
+        llm_complete(llm, "Reply with the single word: OK")
         return None
     except Exception as e:
         return str(e)
@@ -514,7 +523,7 @@ with st.sidebar:
     # ── API PROVIDER ──
     st.markdown("<h3>AI Provider</h3>", unsafe_allow_html=True)
     provider = st.selectbox(
-        "Provider", ["Gemini", "OpenAI"],
+        "Provider", ["Groq", "Gemini", "OpenAI"],
         label_visibility="collapsed",
         key="provider_select",
     )
@@ -522,7 +531,7 @@ with st.sidebar:
     # Pull from secrets if available
     secret_key = ""
     try:
-        secret_map = {"Gemini": "GEMINI_API_KEY", "OpenAI": "OPENAI_API_KEY"}
+        secret_map = {"Groq": "GROQ_API_KEY", "Gemini": "GEMINI_API_KEY", "OpenAI": "OPENAI_API_KEY"}
         secret_key = st.secrets.get(secret_map[provider], "")
     except Exception:
         pass
@@ -536,8 +545,9 @@ with st.sidebar:
     )
 
     hint_map = {
-        "Gemini": "Free · gemini-2.0-flash",
-        "OpenAI": "Paid · gpt-4o-mini",
+        "Groq":   "Free · llama-3.3-70b · 30 RPM — get key: console.groq.com",
+        "Gemini": "Free · gemini-2.0-flash · 15 RPM — get key: aistudio.google.com",
+        "OpenAI": "Paid · gpt-4o-mini — get key: platform.openai.com",
     }
     st.markdown(
         f'<p style="color:#444;font-size:.65rem;margin-top:-8px;">{hint_map[provider]}</p>',
@@ -673,7 +683,7 @@ with st.sidebar:
     prov_label = st.session_state.get("provider", provider)
     st.markdown(
         f'<p style="font-size:.58rem;color:#1c1c2e;text-align:center;letter-spacing:1px;">'
-        f'{prov_label.upper()} · TF-IDF · FAISS · STREAMLIT</p>',
+        f'{prov_label.upper()} · TF-IDF · STREAMLIT</p>',
         unsafe_allow_html=True,
     )
 
@@ -791,19 +801,11 @@ if prompt := st.chat_input(placeholder, disabled=not is_ready):
 
                 except Exception as e:
                     err = str(e)
-                    is_rate = any(k in err.lower() for k in
-                                  ("429", "quota", "rate", "resource_exhausted", "too many"))
-                    if is_rate and mode_used == "pdf" and docs:
-                        # Graceful local fallback — no API needed
+                    if _is_rate_limit(err) and mode_used in ("pdf", "none"):
+                        # Instant local fallback — never hang on retries
+                        if not docs and "pdf_store" in st.session_state:
+                            docs = retrieve_pdf(prompt, st.session_state.pdf_store)
                         fallback = local_fallback_answer(prompt, docs)
-                        st.markdown(fallback)
-                        st.session_state.messages.append(
-                            {"role": "assistant", "content": fallback}
-                        )
-                    elif is_rate and mode_used == "pdf":
-                        # Retrieve was fine, generation failed — do local anyway
-                        docs2 = retrieve_pdf(prompt, st.session_state.pdf_store)
-                        fallback = local_fallback_answer(prompt, docs2)
                         st.markdown(fallback)
                         st.session_state.messages.append(
                             {"role": "assistant", "content": fallback}
