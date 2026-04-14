@@ -3,6 +3,5 @@ openai
 faiss-cpu
 numpy
 pypdf
-sentence-transformers
 scikit-learn
 pandas
