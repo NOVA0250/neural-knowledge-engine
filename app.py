@@ -1,276 +1,211 @@
 import streamlit as st
 import os
+import tempfile
 from pdf_utils import load_and_chunk_pdfs
 from embeddings import EmbeddingManager
 from retrieval import HybridRetriever
 from qa import QASystem
-import tempfile
 
-# =========================
-# PAGE CONFIG
-# =========================
+# -------------------- PAGE CONFIG --------------------
 st.set_page_config(
-    page_title="Neural Knowledge Engine",
+    page_title="NEURAL KNOWLEDGE ENGINE",
     page_icon="🧠",
     layout="wide"
 )
 
-# =========================
-# ULTRA UI (HUD + APPLE + ANIMATIONS)
-# =========================
+# -------------------- CUSTOM CSS (SPIDERMAN UI) --------------------
 st.markdown("""
 <style>
 
-/* GLOBAL */
-html, body {
-    background: radial-gradient(circle at top, #0a0f2c, #020617);
-    color: #e2e8f0;
-    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Orbitron', sans-serif;
+    background: radial-gradient(circle at top, #0a0f2c, #000000);
+    color: white;
 }
 
-/* ANIMATED BACKGROUND GLOW */
-body::before {
-    content: "";
-    position: fixed;
-    width: 200%;
-    height: 200%;
-    background: radial-gradient(circle, rgba(59,130,246,0.15), rgba(239,68,68,0.1));
-    animation: pulseBG 8s infinite alternate;
-    z-index: -1;
-}
-
-@keyframes pulseBG {
-    0% { transform: translate(-25%, -25%) scale(1); }
-    100% { transform: translate(-30%, -30%) scale(1.2); }
-}
-
-/* TITLE */
-.title-glow {
-    font-size: 2.8rem;
-    font-weight: 900;
+/* Title Glow */
+.title {
+    font-size: 42px;
+    font-weight: 600;
     text-align: center;
-    color: #60a5fa;
-    letter-spacing: 1px;
-    text-shadow:
-        0 0 10px #3b82f6,
-        0 0 20px #1d4ed8,
-        0 0 30px #ef4444;
-    animation: glowPulse 2s infinite alternate;
+    color: #ff1e1e;
+    text-shadow: 0 0 15px #ff0000, 0 0 30px #1e90ff;
+    margin-bottom: 10px;
 }
 
-@keyframes glowPulse {
-    from { text-shadow: 0 0 10px #3b82f6; }
-    to { text-shadow: 0 0 25px #ef4444; }
-}
-
-/* GLASS CARD */
-.glass {
-    background: rgba(255,255,255,0.05);
-    backdrop-filter: blur(16px);
-    border-radius: 18px;
+/* Cards */
+.card {
+    background: rgba(10, 15, 50, 0.7);
     padding: 20px;
-    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 15px;
+    border: 1px solid rgba(255,0,0,0.3);
     transition: 0.3s;
 }
 
-/* HOVER GLOW */
-.glass:hover {
-    transform: translateY(-6px);
-    box-shadow:
-        0 0 20px #3b82f6,
-        0 0 40px #ef4444;
+.card:hover {
+    box-shadow: 0 0 20px #ff0000, 0 0 40px #1e90ff;
+    transform: scale(1.02);
 }
 
-/* CHAT BUBBLE */
+/* Buttons */
+.stButton>button {
+    background: linear-gradient(90deg, #0f2027, #203a43, #2c5364);
+    border-radius: 12px;
+    color: white;
+    border: 1px solid #ff0000;
+    transition: 0.3s;
+}
+
+.stButton>button:hover {
+    box-shadow: 0 0 15px red, 0 0 25px blue;
+    transform: scale(1.05);
+}
+
+/* Chat bubbles */
 [data-testid="stChatMessage"] {
-    background: rgba(15, 23, 42, 0.7);
-    border-radius: 14px;
-    padding: 12px;
-    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 15px;
+    padding: 10px;
+    margin-bottom: 10px;
+    background: rgba(20,20,50,0.6);
+    border: 1px solid rgba(255,0,0,0.3);
+    transition: 0.3s;
 }
 
-/* INPUT */
-textarea {
-    background: rgba(2,6,23,0.9) !important;
-    color: #fff !important;
-    border-radius: 12px !important;
-    border: 1px solid #1e293b !important;
+[data-testid="stChatMessage"]:hover {
+    box-shadow: 0 0 10px red, 0 0 20px blue;
 }
 
-/* INPUT FOCUS ANIMATION */
-textarea:focus {
-    border: 1px solid #ef4444 !important;
-    box-shadow:
-        0 0 10px #ef4444,
-        0 0 20px #3b82f6 !important;
-}
-
-/* BUTTON */
-button[kind="primary"] {
-    background: linear-gradient(90deg, #3b82f6, #ef4444) !important;
-    border-radius: 12px !important;
-    font-weight: bold;
-}
-
-/* BUTTON HOVER */
-button:hover {
-    box-shadow:
-        0 0 15px #3b82f6,
-        0 0 25px #ef4444 !important;
-}
-
-/* SIDEBAR */
+/* Sidebar */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #020617, #0a0f2c);
+    background: #050816;
+    border-right: 1px solid rgba(255,0,0,0.2);
 }
 
-/* HUD LINES */
-.hud {
-    position: relative;
-}
-
-.hud::before, .hud::after {
-    content: "";
-    position: absolute;
-    border: 1px solid rgba(59,130,246,0.3);
-    width: 20px;
-    height: 20px;
-}
-
-.hud::before {
-    top: 0;
-    left: 0;
-    border-right: none;
-    border-bottom: none;
-}
-
-.hud::after {
-    bottom: 0;
-    right: 0;
-    border-left: none;
-    border-top: none;
-}
-
-/* SCROLLBAR */
-::-webkit-scrollbar {
-    width: 6px;
-}
-::-webkit-scrollbar-thumb {
-    background: linear-gradient(#3b82f6, #ef4444);
+/* HUD divider */
+hr {
+    border: 1px solid rgba(255,0,0,0.2);
 }
 
 </style>
 """, unsafe_allow_html=True)
 
-# =========================
-# HEADER
-# =========================
-st.markdown('<div class="title-glow">🧠 NEURAL KNOWLEDGE ENGINE</div>', unsafe_allow_html=True)
-st.markdown("### ⚡ Hybrid Intelligence • Retrieval • Reasoning")
+# -------------------- HEADER --------------------
+st.markdown('<div class="title">🧠 NEURAL KNOWLEDGE ENGINE</div>', unsafe_allow_html=True)
+st.markdown("### ⚡ Hybrid Intelligence • FAISS + BM25 • Real-Time Reasoning")
 
-# =========================
-# SESSION STATE
-# =========================
-for key in ["documents","embedding_manager","retriever","qa_system","chat_history","processed_files"]:
-    if key not in st.session_state:
-        st.session_state[key] = [] if key in ["chat_history","processed_files"] else None
+# -------------------- SESSION STATE --------------------
+if 'documents' not in st.session_state:
+    st.session_state.documents = None
+if 'embedding_manager' not in st.session_state:
+    st.session_state.embedding_manager = None
+if 'retriever' not in st.session_state:
+    st.session_state.retriever = None
+if 'qa_system' not in st.session_state:
+    st.session_state.qa_system = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = []
 
-# =========================
-# API KEYS
-# =========================
+# -------------------- API KEY --------------------
 try:
     groq_api_key = st.secrets["GROQ_API_KEY"]
 except:
-    st.error("Add GROQ_API_KEY")
+    st.error("Add GROQ_API_KEY in Streamlit secrets")
     st.stop()
 
-qdrant_api_key = st.secrets.get("QDRANT_API_KEY", None)
-qdrant_endpoint = st.secrets.get("QDRANT_ENDPOINT", None)
-use_qdrant = bool(qdrant_api_key and qdrant_endpoint)
+# -------------------- SIDEBAR --------------------
+st.sidebar.markdown("## 🕷 Upload Intelligence Files")
 
-# =========================
-# SIDEBAR
-# =========================
-st.sidebar.markdown("## 📁 Upload PDFs")
-uploaded_files = st.sidebar.file_uploader("Drop files", type="pdf", accept_multiple_files=True)
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDFs",
+    type="pdf",
+    accept_multiple_files=True
+)
 
-# =========================
-# PROCESSING
-# =========================
+# -------------------- PROCESS FILES --------------------
 if uploaded_files:
     current_files = [f.name for f in uploaded_files]
 
     if current_files != st.session_state.processed_files:
-        with st.spinner("⚡ Neural Indexing..."):
+        with st.spinner("⚡ Neural Processing..."):
             temp_paths = []
+
             for f in uploaded_files:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(f.read())
                     temp_paths.append(tmp.name)
 
-            documents = load_and_chunk_pdfs(temp_paths, chunk_size=150, overlap=30)
+            documents = load_and_chunk_pdfs(temp_paths)
 
             for p in temp_paths:
                 os.unlink(p)
 
             st.session_state.documents = documents
 
-            embedding_manager = EmbeddingManager(
-                use_qdrant=use_qdrant,
-                qdrant_api_key=qdrant_api_key,
-                qdrant_endpoint=qdrant_endpoint
-            )
+            embedding_manager = EmbeddingManager()
             embedding_manager.build_index(documents)
 
-            retriever = HybridRetriever(embedding_manager, documents, top_k=7)
+            retriever = HybridRetriever(embedding_manager, documents)
             qa_system = QASystem(groq_api_key, retriever)
 
             st.session_state.embedding_manager = embedding_manager
             st.session_state.retriever = retriever
             st.session_state.qa_system = qa_system
-            st.session_state.chat_history = []
             st.session_state.processed_files = current_files
+            st.session_state.chat_history = []
 
-# =========================
-# MAIN UI
-# =========================
+# -------------------- MAIN UI --------------------
 if st.session_state.documents:
 
-    st.markdown('<div class="glass hud">', unsafe_allow_html=True)
+    st.sidebar.markdown("### 📊 System Stats")
+    st.sidebar.write(f"Chunks: {len(st.session_state.documents)}")
+    st.sidebar.write(f"Files: {len(st.session_state.processed_files)}")
 
+    st.markdown("## 💬 Neural Chat Interface")
+
+    # Chat History
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    st.markdown('</div>', unsafe_allow_html=True)
-
+    # Input
     question = st.chat_input("Ask anything...")
 
     if question:
-        st.session_state.chat_history.append({"role":"user","content":question})
+        st.session_state.chat_history.append({"role": "user", "content": question})
 
         with st.chat_message("assistant"):
             placeholder = st.empty()
             response = ""
 
-            for chunk in st.session_state.qa_system.answer_question(
-                question,
-                chat_history=st.session_state.chat_history[-10:]
-            ):
+            for chunk in st.session_state.qa_system.answer_question(question):
                 response += chunk
                 placeholder.markdown(response + "▌")
 
             placeholder.markdown(response)
 
-            st.session_state.chat_history.append({"role":"assistant","content":response})
+        st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+    if st.sidebar.button("🧹 Reset System"):
+        st.session_state.chat_history = []
+        st.rerun()
 
 else:
-    st.markdown('<div class="glass hud">', unsafe_allow_html=True)
-    st.info("👈 Upload PDFs to activate system")
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="card">
+        <h3>🚀 System Capabilities</h3>
+        <ul>
+            <li>Hybrid Retrieval (FAISS + BM25)</li>
+            <li>Context-aware AI reasoning</li>
+            <li>Streaming responses</li>
+            <li>Multi-PDF Intelligence</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
 
-# =========================
-# FOOTER
-# =========================
+# -------------------- FOOTER --------------------
 st.sidebar.markdown("---")
-st.sidebar.markdown("⚡ SYSTEM ACTIVE")
+st.sidebar.markdown("⚡ Powered by Groq + FAISS + Transformers")
