@@ -8,13 +8,13 @@ import tempfile
 
 # Page configuration
 st.set_page_config(
-    page_title="Hybrid PDF Q&A System",
+    page_title="NEURAL KNOWLEDGE ENGINE",
     page_icon="📚",
     layout="wide"
 )
 
 # Title and description
-st.title("📚 Hybrid PDF Q&A System")
+st.title("📚 Hybrid -NEURAL KNOWLEDGE ENGINE")
 st.markdown("Upload PDFs and ask questions using advanced hybrid search (FAISS + BM25 + optional Qdrant)")
 
 # Initialize session state
