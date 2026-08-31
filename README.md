@@ -1,4 +1,4 @@
-📚 Hybrid CHATBOT System using RAG
+📚 NEURAL KNOWLEDGE ENGINE System using RAG
 An AI-powered Question-Answering System built using Streamlit, combining semantic search (FAISS) and keyword search (BM25) with optional Qdrant vector database and Groq LLM for fast, accurate responses.
 ---
 🚀 Features
